@@ -45,7 +45,8 @@ timeB=$(date '+%s')
 
 HANA_STATE_PRIMARY=0
 HANA_STATE_SECONDARY=1
-HANA_STATE_DEFECT=2
+HANA_STATE_STANDALONE=2
+HANA_STATE_DEFECT=3
 
 SH=/bin/sh
 
@@ -131,7 +132,7 @@ function saphana_meta_data() {
 <?xml version="1.0"?>
 <!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
 <resource-agent name="SAPHana">
-<version>0.148.3</version>
+<version>0.148.7.3</version>
 
 <shortdesc lang="en">Manages two SAP HANA instances in system replication (SR).</shortdesc>
 <longdesc lang="en">
@@ -167,8 +168,8 @@ The resource agent uses the following four interfaces provided by SAP:
 4. hdbsql / systemReplicationStatus
    Interface is SQL query into HANA (system replication table).  The hdbsql query will be replaced by a python script 
    "systemReplicationStatus.py" in SAP HANA SPS8 or 9.
-   As long as wee need to use hdbsql you need to setup secure store users for linux user root to be able to
-   access the SAP HANA database. You need to configure a secure store user key "SLEHALOC" which can connect the SAP
+   As long as we need to use hdbsql you need to setup secure store users for linux user root to be able to
+   access the SAP HANA database. You need to configure a secure store user key "SLEHALOC"/"RHELHALOC" which can connect the SAP
    HANA database: 
 
 5. saphostctrl
@@ -292,7 +293,10 @@ function remoteHost2remoteNode()
     local remoteHost="$1"
     local remoteNode=""
     local rc=1
-    clusterNodes=($(crm_node -l | awk '$3 == "member" { if ($2 != me) { print $2 }}' me=${HOSTNAME}))
+    case $(crm_attribute --type crm_config --name cluster-infrastructure -q) in    
+       *openais* ) clusterNodes=($(crm_node -l | awk '$3 == "member" { if ($2 != me) { print $2 }}' me=${HOSTNAME}));;
+       *cman*    ) clusterNodes=($(crm_node -l | awk '{for (i=1; i<=NF; i++) { if ($i != me) { print $i }}}' me=${HOSTNAME}));;
+    esac
     for cl in ${clusterNodes[@]}; do
         vHost=$(get_hana_attribute $cl  ${ATTR_NAME_HANA_VHOST[@]})
         if [ "$vHost" = "$remoteHost" ]; then # we found the correct node
@@ -404,7 +408,7 @@ function assert() {
         exit $OCF_SUCCESS
     fi
     super_ocf_log err "ACT: $err_msg"
-    exit $default_exit
+    exit $OCF_NOT_RUNNING
 }
 
 #
@@ -503,6 +507,12 @@ function saphana_init() {
     # We rely on the following format: SID is word#4, NR is work#6, vHost is word#8
     vName=$(/usr/sap/hostctrl/exe/saphostctrl -function ListInstances \
         | awk '$4 == SID && $6=NR { print $8 }' SID=$SID NR=$InstanceNr)
+    if [ -z "$vName" ]; then
+       #
+       # if saphostctrl does not know the answer, try to fallback to attribute provided by SAPHanaTopology
+       #
+       vName=$(get_hana_attribute ${HOSTNAME} ${ATTR_NAME_HANA_VHOST[@]});
+    fi
     SAPVIRHOST=${vName}
     PreferSiteTakeover="$OCF_RESKEY_PREFER_SITE_TAKEOVER"
     SAPHanaFilter="${OCF_RESKEY_SAPHanaFilter:-ra-act-dec-lpa}"
@@ -559,7 +569,10 @@ function saphana_init() {
     #
     remoteHost=$(get_hana_attribute ${HOSTNAME} ${ATTR_NAME_HANA_REMOTEHOST[@]});
     if [ -z "$remoteHost" ]; then
-       remoteHosts=($(crm_node -l | awk '$3 == "member" { if ($2 != me) { print $2 }}' me=${HOSTNAME}))
+       case $(crm_attribute --type crm_config --name cluster-infrastructure -q) in
+          *openais* ) remoteHosts=($(crm_node -l | awk '$3 == "member" { if ($2 != me) { print $2 }}' me=${HOSTNAME}));;
+          *cman*    ) remoteHosts=($(crm_node -l | awk '{for (i=1; i<=NF; i++) { if ($i != me) { print $i }}}' me=${HOSTNAME}));;
+       esac
        if [ ${#remoteHosts[@]} -eq 1 ]; then # we are a 2 node cluster, lets assume the other is the remote-host
           remoteHost=${remoteHosts[0]}
           remoteNode=$remoteHost
@@ -599,7 +612,16 @@ function saphana_init() {
 
     [ -z "$DIR_EXECUTABLE" ] && assert "Cannot find sapstartsrv and sapcontrol executable, please set DIR_EXECUTABLE parameter!"
     DIR_PROFILE="${OCF_RESKEY_DIR_PROFILE:-/usr/sap/$SID/SYS/profile}"
-    SAPSTARTPROFILE="$DIR_PROFILE/${OCF_RESKEY_INSTANCE_PROFILE:-${SID}_${InstanceName}_${SAPVIRHOST}}"
+    # check, if the following fall-back is ok, or if there could be multiple profiles matching this pattern
+    if [ -n "${SAPVIRHOST}" ]; then
+        SAPSTARTPROFILE="$DIR_PROFILE/${OCF_RESKEY_INSTANCE_PROFILE:-${SID}_${InstanceName}_${SAPVIRHOST}}"
+    else
+        # check, if the following fall-back is ok, or if there could be multiple profiles matching this pattern
+        # also take profile versions into account - they might break this fall-back
+        # TODO: PRIO4: Check, if it makes sense to implement an additional last fall-back: get the SAPSTARTPROFILE from /usr/sap/sapservices
+        #
+        SAPSTARTPROFILE="$(ls -1 $DIR_PROFILE/${OCF_RESKEY_INSTANCE_PROFILE:-${SID}_${InstanceName}_*})"
+    fi
     # as root user we need the library path to the SAP kernel to be able to call sapcontrol
     # check, if we already added DIR_EXECUTABLE at the beginning of LD_LIBRARY_PATH
     if [ "${LD_LIBRARY_PATH%%*:}" != "$DIR_EXECUTABLE" ]
@@ -737,15 +759,27 @@ function check_for_primary() {
     node_full_status=$(su - ${sidadm} -c "hdbnsutil -sr_state" 2>/dev/null )
     node_status=$(echo "$node_full_status" | awk '$1=="mode:" {print $2}')
     super_ocf_log debug "DBG: check_for_primary: node_status=$node_status"
-    case "$node_status" in
-        primary ) rc=$HANA_STATE_PRIMARY;;
-        syncmem | sync | async ) 
-                  rc=$HANA_STATE_SECONDARY;;
-        none )    # have seen that mode on second side BEFEORE we registered it as replica
-                  rc=$HANA_STATE_DEFECT;;
-        * )       super_ocf_log err "ACT: HDB Instance mode <$node_status> does not match primary,syncmem,sync or async."
-                  rc=$HANA_STATE_DEFECT;;
-    esac;
+    for i in  1 2 3 4 5 6 7 8 9; do
+       case "$node_status" in
+           primary ) 
+                  super_ocf_log info "FLOW $FUNCNAME rc=HANA_STATE_PRIMARY"
+                  return $HANA_STATE_PRIMARY;;
+           syncmem | sync | async )
+                  super_ocf_log info "FLOW $FUNCNAME rc=HANA_STATE_SECONDARY"
+                  return $HANA_STATE_SECONDARY;;
+           none )     # have seen that mode on second side BEFEORE we registered it as replica
+                  super_ocf_log info "FLOW $FUNCNAME rc=HANA_STATE_STANDALONE"
+                  return $HANA_STATE_STANDALONE;;
+           * )
+	          super_ocf_log err "ACT: check_for_primary:  we didn't expect node_status to be: <$node_status>"
+                  dump=$( echo $node_status | hexdump -C );
+	          super_ocf_log err "ACT: check_for_primary:  we didn't expect node_status to be: DUMP <$dump>"
+                  node_full_status=$(su - ${sidadm} -c "hdbnsutil -sr_state" 2>/dev/null )
+                  node_status=$(echo "$node_full_status" | awk '$1=="mode:" {print $2}')
+                  super_ocf_log debug "DEC: check_for_primary: loop=$i: node_status=$node_status"
+                  # TODO: PRIO1: Maybe we need to keep the old value for P/S/N, if hdbnsutil just crashes
+       esac;
+    done
     super_ocf_log info "FLOW $FUNCNAME rc=$rc"
     return $rc
 }
@@ -767,6 +801,19 @@ function analyze_hana_sync_status()
     local query_secondaries='select distinct  SECONDARY_HOST from SYS.M_SERVICE_REPLICATION'
     local query_failed_secondaries="select distinct SECONDARY_HOST from SYS.M_SERVICE_REPLICATION  where SECONDARY_SITE_NAME = (select distinct  SECONDARY_SITE_NAME from SYS.M_SERVICE_REPLICATION WHERE REPLICATION_STATUS != 'ACTIVE')"
     local all_cluster_hosts all_secondary_hosts all_broken_secondaries
+    # TODO: PRIO4: remove check_secstore_users later
+    check_secstore_users SLEHALOC; chkusr=$?
+    if [ $chkusr -ne 0 ]; then
+         check_secstore_users RHELHALOC; chkusr=$?
+         if [ $chkusr -ne 0 ]; then
+              super_ocf_log err  "ACT: Secure store users are missing (see best practice manual how to setup the users)"
+              rc=$OCF_ERR_CONFIGURED
+         else
+             secUser="RHELHALOC"
+         fi
+    else
+         secUser="SLEHALOC"
+    fi
     hana_sync_status=$(timeout 60 $DIR_EXECUTABLE/hdbsql -a -x -U $secUser  $query_state); sqlrc=$?
     hana_sync_status=$(echo $hana_sync_status | dequote)
     super_ocf_log debug "DBG: hdbsql rc=$sqlrc hana_sync_status=\"$hana_sync_status\""
@@ -775,9 +822,11 @@ function analyze_hana_sync_status()
         # UNKNOWN, ACTIVE, ERROR, INITIALIZING
         #
         if [ "${hana_sync_status}" == "ACTIVE" ]; then
+            # TODO PRIO1: REMOVE remoteNode dependency - set SOK
             set_hana_attribute "$remoteNode" "SOK" ${ATTR_NAME_HANA_SYNC_STATUS[@]}
         else
             super_ocf_log warn "ACT: HANA SYNC STATUS is: ${hana_sync_status}"
+            # TODO PRIO1: REMOVE remoteNode dependency - set SFAIL
             set_hana_attribute "$remoteNode" "SFAIL" ${ATTR_NAME_HANA_SYNC_STATUS[@]}
         fi
         # first get a list of all secondary hosts, than a list of all secondary hosts, if the is ANY failure at this site
@@ -807,7 +856,10 @@ function analyze_hana_sync_status()
                 # DONE: PRIO1: We should NOT set SFAIL, if HDB is exactly broken now
                 #       When HDB breaks during monitor this could prevent a prositive remote failover
                 super_ocf_log warn "ACT: Was not able to fetch HANA SYNC STATUS - set sync status to SFAIL for ALL OTHER cluster hosts"
-                all_cluster_hosts=$(crm_node -Q -l -A | awk '($3 == "member") && ($2 != lh)  { print $2 }' lh=${HOSTNAME})
+                case $(crm_attribute --type crm_config --name cluster-infrastructure -q) in
+                   *openais* ) all_cluster_hosts=$(crm_node -Q -l -A | awk '($3 == "member") && ($2 != lh)  { print $2 }' lh=${HOSTNAME});;
+                   *cman*    ) all_cluster_hosts=$(crm_node -l | awk '{for (i=1; i<=NF; i++) { if ($i != me) { print $i }}}' me=${HOSTNAME});;
+                esac
                 for n in $all_cluster_hosts; do
                     set_hana_attribute "$n" "SFAIL" ${ATTR_NAME_HANA_SYNC_STATUS[@]}
                 done
@@ -987,6 +1039,7 @@ function saphana_start_primary()
     #
     super_ocf_log debug "DBG: saphana_primary - check_for_primary reports HANA_STATE_PRIMARY"
     # 
+    lpa_init_lpt $HANA_STATE_PRIMARY
     lpa_check_lpt_status; lpa_dec=$?
     get_hana_landscape_status; lss=$?
     my_role=$(get_hana_attribute ${HOSTNAME} ${ATTR_NAME_HANA_ROLES[@]})
@@ -1022,12 +1075,16 @@ function saphana_start_primary()
             case "$lss" in
                 2 | 3 | 4 ) # as landcape says we are up - just set the scores and return code
                     super_ocf_log info "LPA: landcape: UP, LPA: start ==> keep running"
+                    LPTloc=$(date '+%s')
+                    lpa_set_lpt $LPTloc
                     rc=$OCF_SUCCSESS
                     ;;
                 1 ) # landcape says we are down, lets start and adjust scores and return code
                     super_ocf_log info "LPA: landcape: DOWN, LPA: start ==> start instance"
                     saphana_start
                     rc=$?                    
+                    LPTloc=$(date '+%s')
+                    lpa_set_lpt $LPTloc
                     ;;
             esac
             scoring_crm_master "$my_role" "$my_sync"
@@ -1109,7 +1166,10 @@ check_for_primary_master()
     #
     # get actual list of cluster members
     # 
-    otherHosts=($(crm_node -l | awk '$3 == "member" { if ($2 != me) { print $2 }}' me=${HOSTNAME}))
+    case $(crm_attribute --type crm_config --name cluster-infrastructure -q) in
+       *openais* ) otherHosts=($(crm_node -l | awk '$3 == "member" { if ($2 != me) { print $2 }}' me=${HOSTNAME}));;
+       *cman*    ) otherHosts=($(crm_node -l | awk '{for (i=1; i<=NF; i++) { if ($i != me) { print $i }}}' me=${HOSTNAME}));;
+    esac
     if [ -n "$otherHosts" ]; then
         for ch in ${otherHosts[@]}; do
             if [ $rc -eq 1 ]; then
@@ -1183,6 +1243,7 @@ function saphana_start_secondary()
     ####### LPA - end
     # 
     #
+    #             lpa_set_lpt  30
     # we would be slave (secondary)
     # we first need to check, if there are Master Nodes, because the Scecondary only starts
     # successfuly, if the Primary is available. Thatfore we mark the Secondary as "WAITING"
@@ -1203,6 +1264,8 @@ function saphana_start_secondary()
                set_crm_master -INFINITY
                rc=$OCF_SUCCSESS
            fi
+       else
+               lpa_set_lpt  30
        fi
     else
        super_ocf_log info "ACT: wait_for_primary_master ==> WAITING"
@@ -1335,9 +1398,11 @@ function lpa_init_lpt() {
     LPTloc=$(lpa_get_lpt ${HOSTNAME}) || LPTloc=$(lpa_pull_lpt) || \
         if   [ "$hana_state" -eq "$HANA_STATE_PRIMARY" ];  then    # Initialize for Primary
             # init primary
+            LPTloc=20
             lpa_push_lpt "20"; rc=$?
         elif [ "$hana_state" -eq "$HANA_STATE_SECONDARY" ]; then   # Initialize for Secondary
             # init secondary
+            LPTloc=10
             lpa_push_lpt "10"; rc=$?
         else
             rc=2                                   
@@ -1397,6 +1462,7 @@ function lpa_check_lpt_status() {
             LPTloc=20                           # DEFAULT
         fi
     fi
+            # TODO PRIO1: REMOVE remoteNode dependency - lpa_get_lpt
     LPTrem=$(lpa_get_lpt $remoteNode); lparc=$?
     if [ $lparc -ne 0 ]; then
         # LPT of the other node could not be evaluated - LPA says WAIT
@@ -1447,6 +1513,19 @@ function saphana_start_clone() {
     # TODO: PRIO4: remove check_secstore_users later
     check_secstore_users SLEHALOC; chkusr=$?
     if [ $chkusr -ne 0 ]; then
+         check_secstore_users RHELHALOC; chkusr=$?
+         if [ $chkusr -ne 0 ]; then
+              super_ocf_log err  "ACT: Secure store users are missing (see best practice manual how to setup the users)"
+              rc=$OCF_ERR_CONFIGURED
+         else
+             set_hana_attribute ${HOSTNAME} "DEMOTED" ${ATTR_NAME_HANA_CLONE_STATE[@]}
+             check_for_primary; primary_status=$?
+             if [ $primary_status -eq $HANA_STATE_PRIMARY ]; then
+                 saphana_start_primary; rc=$?
+             else
+                 saphana_start_secondary; rc=$?
+             fi
+         fi
          super_ocf_log err  "ACT: Secure store users are missing (see best practice manual how to setup the users)"
          rc=$OCF_ERR_CONFIGURED
     else
@@ -1489,8 +1568,8 @@ function saphana_stop_clone() {
 function saphana_monitor_primary()
 {
     super_ocf_log info "FLOW $FUNCNAME ($*)"
-	local rc=$OCF_ERR_GENERIC
-	local promoted=0
+    local rc=$OCF_ERR_GENERIC
+    local promoted=0
     local init_attribute=0
     local LPTloc=-1
     local lparc=4
@@ -1586,6 +1665,7 @@ function saphana_monitor_primary()
                         # DONE: PRIO1: first check, if remote site is already (and still) in sync
                         # TODO: PRIO4: Decide if penality (-9000) or weak (5) is better here to cover situations where other clone is gone
                         #
+            # TODO PRIO1: REMOVE remoteNode dependency - get_sync_status
                         remoteSync=$(get_hana_attribute $remoteNode ${ATTR_NAME_HANA_SYNC_STATUS[@]})
                         case "$remoteSync" in
                             SOK )
@@ -1649,6 +1729,23 @@ function saphana_monitor_primary()
                         analyze_hana_sync_status
                         ;;
                 esac
+                ## begin fix bnc#892466 - MGFH ########################
+                rem_role=$(get_hana_attribute ${remoteHost} ${ATTR_NAME_HANA_ROLES[@]})
+                rem_clone_status=$(get_hana_attribute ${remoteHost} ${ATTR_NAME_HANA_CLONE_STATE[@]})
+                if [ "$promote_attr" = "DEMOTED" -a "$rem_clone_status" = "PROMOTED" ]; then
+                   case "$rem_role" in
+                       [234]:P:* ) # dual primary, but other instance marked as PROMOTED by the cluster
+                           lpa_check_lpt_status; again_lpa_rc=$?
+                           if [ $again_lpa_rc -eq 2 ]; then
+                               super_ocf_log info "DEC: Dual primary detected, other instance is PROMOTED and lpa stalemate ==> local restart"                            
+                               lpa_set_lpt 10
+                               lpa_push_lpt 10
+                              rc=$OCF_NOT_RUNNING
+                           fi
+                          ;;
+                   esac
+                fi
+                ## end  fix bnc#892466 - MGFH ########################
                 scoring_crm_master "$my_role" "$my_sync"
             fi
             ;;
@@ -1672,7 +1769,7 @@ function saphana_monitor_primary()
 # function: saphana_monitor_secondary - monitor a hana clone instance
 # params:   -
 # globals:  OCF_*, ATTR_NAME_*, HOSTNAME
-# saphana_monitor_secondary #
+# saphana_monitor_secondary
 #
 function saphana_monitor_secondary()
 {
@@ -1864,7 +1961,7 @@ function saphana_promote_clone() {
                 #
                 # now gain check, if we are primary NOW
                 #
-                # TODO: PRIO3: check, if we need to destigush between HANA_STATE_PRIMARY, HANA_STATE_SECONDARY, HANA_STATE_DEFECT
+                # TODO: PRIO3: check, if we need to destinguish between HANA_STATE_PRIMARY, HANA_STATE_SECONDARY, HANA_STATE_DEFECT
                 #
                 if check_for_primary; then
                     rc=$OCF_SUCCESS;
@@ -1927,7 +2024,6 @@ SAPCONTROL=""
 DIR_PROFILE=""
 SAPSTARTPROFILE=""
 SAPHanaFilter="${OCF_RESKEY_SAPHanaFilter:-ra-act-dec-lpa}"
-
 
 if [ $# -ne 1 ]
 then
