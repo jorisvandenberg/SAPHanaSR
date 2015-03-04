@@ -132,7 +132,7 @@ function saphana_meta_data() {
 <?xml version="1.0"?>
 <!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
 <resource-agent name="SAPHana">
-<version>0.148.7.3</version>
+<version>0.149.4</version>
 
 <shortdesc lang="en">Manages two SAP HANA instances in system replication (SR).</shortdesc>
 <longdesc lang="en">
@@ -169,7 +169,7 @@ The resource agent uses the following four interfaces provided by SAP:
    Interface is SQL query into HANA (system replication table).  The hdbsql query will be replaced by a python script 
    "systemReplicationStatus.py" in SAP HANA SPS8 or 9.
    As long as we need to use hdbsql you need to setup secure store users for linux user root to be able to
-   access the SAP HANA database. You need to configure a secure store user key "SLEHALOC"/"RHELHALOC" which can connect the SAP
+   access the SAP HANA database. You need to configure a secure store user key "SAPHANA${SID}SR" which can connect the SAP
    HANA database: 
 
 5. saphostctrl
@@ -562,9 +562,11 @@ function saphana_init() {
     #
     DUPLICATE_PRIMARY_TIMEOUT="${OCF_RESKEY_DUPLICATE_PRIMARY_TIMEOUT:-7200}"
     super_ocf_log debug "DBG: DUPLICATE_PRIMARY_TIMEOUT=$DUPLICATE_PRIMARY_TIMEOUT"
-
+    #
     # Determine list of other cluster nodes and store in otherNodes variable
+    otherNodes=()
     case $(crm_attribute --type crm_config --name cluster-infrastructure -q) in
+       *corosync* ) otherNodes=($(crm_node -l | awk '{ if ($2 != me) { print $2 }}' me=${NODENAME}));;
        *openais* ) otherNodes=($(crm_node -l | awk '$3 == "member" { if ($2 != me) { print $2 }}' me=${NODENAME}));;
        *cman*    ) otherNodes=($(crm_node -l | awk '{for (i=1; i<=NF; i++) { if ($i != me) { print $i }}}' me=${NODENAME}));;
     esac
@@ -651,9 +653,13 @@ function saphana_init() {
 function check_secstore_users()
 {
     super_ocf_log info "FLOW $FUNCNAME ($*)"
-    local user=$1
+    local user=""
     local rc=1
-    $DIR_EXECUTABLE/hdbuserstore list | grep -q "KEY $user" && rc=0
+    while [ $# -gt 0 ]; do
+        user="$1"
+        $DIR_EXECUTABLE/hdbuserstore list | grep -q "KEY $user" && echo "$user" && rc=0 && break
+        shift
+    done
     super_ocf_log info "FLOW $FUNCNAME rc=$rc"
     return $rc
 }
@@ -796,26 +802,30 @@ function analyze_hana_sync_status()
     local vHost=""
     local n=""
     local hana_sync_status="" what_does_the_chamelion_say=""
-    local secUser="slehaLoc"
+    local secUser="SLEHALOC"
     local chkusr;
     local rc=0
     local sqlrc=0
-    local query_state='select distinct REPLICATION_STATUS from SYS.M_SERVICE_REPLICATION'
+# local query_state='select distinct REPLICATION_STATUS from SYS.M_SERVICE_REPLICATION'
+# select distinct REPLICATION_STATUS from SYS.M_SERVICE_REPLICATION where SITE_NAME='"SITE1"'"
+    local query_state="select distinct REPLICATION_STATUS from SYS.M_SERVICE_REPLICATION where SITE_NAME='"${sr_name}"'"
     local query_secondaries='select distinct  SECONDARY_HOST from SYS.M_SERVICE_REPLICATION'
     local query_failed_secondaries="select distinct SECONDARY_HOST from SYS.M_SERVICE_REPLICATION  where SECONDARY_SITE_NAME = (select distinct  SECONDARY_SITE_NAME from SYS.M_SERVICE_REPLICATION WHERE REPLICATION_STATUS != 'ACTIVE')"
     local all_cluster_hosts all_secondary_hosts all_broken_secondaries
-    # TODO: PRIO4: remove check_secstore_users later
-    check_secstore_users SLEHALOC; chkusr=$?
+#
+#####################################################################################################
+#
+# select distinct SITE_NAME, HOST, REPLICATION_STATUS, SECONDARY_SITE_NAME, SECONDARY_HOST from SYS.M_SERVICE_REPLICATION
+#
+# ===> "Walldorf", "sap-app-8"  "ACTIVE", "Rot",  "sap-app-5"
+#      "Rot",      "sap-app-5", "ACTIVE", "oslo", "sap-app-7"
+#
+#####################################################################################################
+#
+    secUser=$(check_secstore_users SAPHANA${SID}SR SLEHALOC RHELHALOC) ; chkusr=$?
     if [ $chkusr -ne 0 ]; then
-         check_secstore_users RHELHALOC; chkusr=$?
-         if [ $chkusr -ne 0 ]; then
-              super_ocf_log err  "ACT: Secure store users are missing (see best practice manual how to setup the users)"
-              rc=$OCF_ERR_CONFIGURED
-         else
-             secUser="RHELHALOC"
-         fi
-    else
-         secUser="SLEHALOC"
+        super_ocf_log err  "ACT: Secure store users are missing (see best practice manual how to setup the users)"
+        rc=$OCF_ERR_CONFIGURED
     fi
     hana_sync_status=$(timeout 60 $DIR_EXECUTABLE/hdbsql -a -x -U $secUser  $query_state); sqlrc=$?
     hana_sync_status=$(echo $hana_sync_status | dequote)
@@ -1243,7 +1253,6 @@ function saphana_start_secondary()
     ####### LPA - end
     # 
     #
-    #             lpa_set_lpt  30
     # we would be slave (secondary)
     # we first need to check, if there are Master Nodes, because the Scecondary only starts
     # successfuly, if the Primary is available. Thatfore we mark the Secondary as "WAITING"
@@ -1334,10 +1343,12 @@ function lpa_set_lpt() {
 function lpa_pull_lpt() {
     super_ocf_log info "FLOW $FUNCNAME ($*)"
     local rc=1
-    local lpt=-1
+    local lpt=""
     local readrest=0
     local lpa_file=$LPA_DIRECTORY/lpa_${sid}_${NODENAME}
-    read lpt readrest <<<$(cat $lpa_file) # exactly load first word from file to lpt
+    if [ -f $lpa_file ]; then
+        read lpt readrest <<<$(cat $lpa_file) # exactly load first word from file to lpt
+    fi
     if [ -n "$lpt" ]; then
         rc=0
         echo $lpt
@@ -1511,22 +1522,10 @@ function saphana_start_clone() {
     local sqlrc;
     local chkusr;
     # TODO: PRIO4: remove check_secstore_users later
-    check_secstore_users SLEHALOC; chkusr=$?
+    secUser=$(check_secstore_users SAPHANA${SID}SR SLEHALOC RHELHALOC) ; chkusr=$?
     if [ $chkusr -ne 0 ]; then
-         check_secstore_users RHELHALOC; chkusr=$?
-         if [ $chkusr -ne 0 ]; then
-              super_ocf_log err  "ACT: Secure store users are missing (see best practice manual how to setup the users)"
-              rc=$OCF_ERR_CONFIGURED
-         else
-             set_hana_attribute ${NODENAME} "DEMOTED" ${ATTR_NAME_HANA_CLONE_STATE[@]}
-             check_for_primary; primary_status=$?
-             if [ $primary_status -eq $HANA_STATE_PRIMARY ]; then
-                 saphana_start_primary; rc=$?
-             else
-                 saphana_start_secondary; rc=$?
-                 lpa_set_lpt  30
-             fi
-         fi
+        super_ocf_log err  "ACT: Secure store users are missing (see best practice manual how to setup the users)"
+        rc=$OCF_ERR_CONFIGURED
     else
         set_hana_attribute ${NODENAME} "DEMOTED" ${ATTR_NAME_HANA_CLONE_STATE[@]}
         check_for_primary; primary_status=$?
@@ -1728,7 +1727,6 @@ function saphana_monitor_primary()
                         analyze_hana_sync_status
                         ;;
                 esac
-                ## begin fix bnc#892466 - MGFH ########################
                 rem_role=$(get_hana_attribute ${remoteHost} ${ATTR_NAME_HANA_ROLES[@]})
                 rem_clone_status=$(get_hana_attribute ${remoteHost} ${ATTR_NAME_HANA_CLONE_STATE[@]})
                 if [ "$promote_attr" = "DEMOTED" -a "$rem_clone_status" = "PROMOTED" ]; then
@@ -1744,7 +1742,6 @@ function saphana_monitor_primary()
                           ;;
                    esac
                 fi
-                ## end  fix bnc#892466 - MGFH ########################
                 scoring_crm_master "$my_role" "$my_sync"
             fi
             ;;
@@ -1768,7 +1765,7 @@ function saphana_monitor_primary()
 # function: saphana_monitor_secondary - monitor a hana clone instance
 # params:   -
 # globals:  OCF_*, ATTR_NAME_*, NODENAME
-# saphana_monitor_secondary #
+# saphana_monitor_secondary
 #
 function saphana_monitor_secondary()
 {
