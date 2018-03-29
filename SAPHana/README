@@ -12,7 +12,7 @@ II. Supported Scenarios and Prerequisites
 For the first version of the SAPHanaSR resource agent software package we limit
 the support to the following scenarios and parameters:
 
-1. Two-node clusters
+1. Two-node cluster
 2. Scale-UP (single-box to single-box) system replication
 3. Both nodes are in the same network segment (layer 2)
 4. Technical users and groups such as sidadm are defined locally in the Linux 
